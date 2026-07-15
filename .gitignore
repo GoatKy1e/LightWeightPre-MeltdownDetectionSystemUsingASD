@@ -16,3 +16,5 @@ sessions/
 # Environments
 .venv/
 venv/
+
+test.ipynb
