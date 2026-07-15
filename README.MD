@@ -28,7 +28,7 @@ above. A fresh clone **builds** but is not **runnable** until these exist:
 
 | Path | Where it comes from |
 |---|---|
-| `dataset.pkl` | The raw annotated dataset (external — you must supply it). |
+| `dataset.pkl` | The ASDPose annotated dataset (external — [download](https://drive.google.com/file/d/13t1tO4ZxTKmQG-w6fTy3hHQy8gX1bopl/view?usp=sharing), see step 1). |
 | `prepared/` | Written by the prep and training notebooks (feature arrays, `v1_model.keras`, `scaler.json`, `v1_meta.json`). |
 | `prepared/*.tflite` | Converted from the trained model + downloaded MoveNet (see setup). |
 | `kt_dir/` | Keras-tuner search state, regenerated when training runs. |
@@ -81,8 +81,14 @@ artifacts, because the notebooks are committed but their outputs are not.
 
 ### 1. Prepare the dataset
 
-Place `dataset.pkl` in the repo root, then run `asdmotion_prep.ipynb` top to bottom.
-Key settings (top of the notebook):
+This project trains on the **ASDPose annotated dataset** from the Dinstein-Lab ASDMotion
+project ([github.com/Dinstein-Lab/ASDMotion](https://github.com/Dinstein-Lab/ASDMotion)) —
+skeletal (pose) representations of children with ASD, with 7,352 manually annotated SMM
+segments. Download the **[Annotated Dataset for Training](https://drive.google.com/file/d/13t1tO4ZxTKmQG-w6fTy3hHQy8gX1bopl/view?usp=sharing)**
+(a `.pkl` file) from that repo's *Downloads* section, save it as `dataset.pkl` in the repo
+root, then run `asdmotion_prep.ipynb` top to bottom.
+
+Key prep settings (top of the notebook):
 
 - `WINDOW = 90` — frames per sample (3 s at 30 fps)
 - `STRIDE_TRAIN = 30` — overlapping train windows (acts as augmentation)
@@ -254,3 +260,35 @@ python smm_backend.py --selftest
   that person, raise keypoint confidence, or use MoveNet Thunder. See the calibration note.
 - **Training loss keeps dropping but validation plateaus.** That's the expected, healthy
   picture after regularization — select the early-stopping epoch and don't over-tune.
+---
+
+## Dataset & attribution
+
+The training data (`dataset.pkl`) and the SMM detection task come from the **ASDMotion /
+ASDPose** project by the Dinstein Lab:
+
+- Repository: <https://github.com/Dinstein-Lab/ASDMotion> (MIT license)
+- Dataset download: [Annotated Dataset for Training](https://drive.google.com/file/d/13t1tO4ZxTKmQG-w6fTy3hHQy8gX1bopl/view?usp=sharing)
+- Paper: Barami T., Manelis-Baram L., Kaiser H., Ilan M., et al. *Automated identification
+  and quantification of stereotypical movements from video recordings of children with
+  ASD.* 2024.
+
+This project is an **independent reimplementation** with a different, lighter approach: it
+trains a 1D-CNN on per-joint **speed** features rather than the paper's PoseConv3D model on
+3D pose heatmaps, and runs live inference with MoveNet instead of OpenPose. It is not
+affiliated with or endorsed by the original authors. If you use the dataset, honor the
+original project's license and terms and cite the paper:
+
+```bibtex
+@article{Barami2024,
+  author  = {Tal Barami and Liora Manelis-Baram and Hadas Kaiser and Michal Ilan and others},
+  title   = {Automated identification and quantification of stereotypical movements
+             from video recordings of children with ASD},
+  year    = {2024},
+  doi     = {10.1101/2024.03.02.582828},
+  journal = {bioRxiv}
+}
+```
+
+The dataset contains clinical data from children with ASD; use it for research under the
+terms set by the original authors.
