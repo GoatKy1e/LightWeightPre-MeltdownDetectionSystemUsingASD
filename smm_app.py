@@ -17,16 +17,19 @@ from collections import deque
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QRectF
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QGridLayout, QComboBox, QDoubleSpinBox, QStackedWidget,
-    QFrame, QSizePolicy, QTextEdit, QMessageBox,
+    QFrame, QSizePolicy, QTextEdit, QMessageBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView,
 )
 
 from smm_backend import (
     Config, SmmEngine, SessionRecorder, Result, check_artifacts, load_threshold,
+    read_sessions, update_notes, filter_sessions_by_range, episode_vs_normal_time,
+    RANGES,
 )
 
 # ── palette ──────────────────────────────────────────────────────────────────
@@ -276,6 +279,254 @@ class Timeline(QWidget):
             prev = cur
 
 
+# rotating palette for categorical slices/bars
+CHART_COLORS = ["#6c8cff", "#3ecf8e", "#ff6b5e", "#f5c451", "#a978ff", "#4fd0e0"]
+
+
+class DonutChart(QWidget):
+    """Donut/pie chart with a centre total and a side legend.
+
+    data: list of (label, value). Zero-value slices are dropped. If everything
+    is zero, shows an empty ring rather than dividing by zero.
+    """
+
+    def __init__(self, center_label="", parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.center_label = center_label
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_data(self, data, center_label=None):
+        self.data = [(l, float(v)) for l, v in data if v]
+        if center_label is not None:
+            self.center_label = center_label
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(PANEL))
+
+        total = sum(v for _l, v in self.data)
+        # donut occupies the left square; legend to the right
+        size = min(h, w * 0.55) - 16
+        cx, cy = 8 + size / 2, h / 2
+        ring = size * 0.26  # ring thickness
+        rect = QRectF(cx - size / 2, cy - size / 2, size, size)
+        inner = QRectF(rect.x() + ring, rect.y() + ring,
+                       rect.width() - 2 * ring, rect.height() - 2 * ring)
+
+        if total <= 0:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(LINE))
+            p.drawEllipse(rect)
+            p.setBrush(QColor(PANEL))
+            p.drawEllipse(inner)
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("", 10))
+            p.drawText(rect, Qt.AlignCenter, "no data")
+            return
+
+        # slices, drawn as pie wedges then punched out to a ring
+        p.setPen(Qt.NoPen)
+        start = 90 * 16  # start at top, Qt angles are 1/16 degree
+        for i, (_l, v) in enumerate(self.data):
+            span = -int(round(v / total * 360 * 16))
+            p.setBrush(QColor(CHART_COLORS[i % len(CHART_COLORS)]))
+            p.drawPie(rect, start, span)
+            start += span
+        p.setBrush(QColor(PANEL))
+        p.drawEllipse(inner)
+
+        # centre total
+        p.setPen(QColor(TEXT))
+        p.setFont(QFont("", 15, QFont.Bold))
+        p.drawText(inner, Qt.AlignCenter,
+                   f"{int(total)}" if total == int(total) else f"{total:.0f}")
+        if self.center_label:
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("", 8))
+            lbl_rect = QRectF(inner.x(), inner.y() + inner.height() * 0.60,
+                              inner.width(), inner.height() * 0.3)
+            p.drawText(lbl_rect, Qt.AlignHCenter | Qt.AlignTop, self.center_label)
+
+        # legend
+        lx = 8 + size + 20
+        ly = (h - len(self.data) * 24) / 2
+        p.setFont(QFont("", 9))
+        for i, (label, v) in enumerate(self.data):
+            y = ly + i * 24
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(CHART_COLORS[i % len(CHART_COLORS)]))
+            p.drawRoundedRect(QRectF(lx, y + 3, 12, 12), 3, 3)
+            p.setPen(QColor(TEXT))
+            pct = v / total * 100
+            p.drawText(QRectF(lx + 20, y, w - lx - 24, 18),
+                       Qt.AlignVCenter | Qt.AlignLeft, f"{label}   {pct:.0f}%")
+
+
+class BarChart(QWidget):
+    """Vertical bar chart. data: list of (label, value). Auto-scales to the max.
+
+    Bars use the accent colour; the single tallest bar is highlighted. Labels
+    sit under each bar and values above it.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.suffix = ""
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_data(self, data, suffix=""):
+        self.data = [(str(l), float(v)) for l, v in data]
+        self.suffix = suffix
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(PANEL))
+        if not self.data:
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("", 10))
+            p.drawText(self.rect(), Qt.AlignCenter, "no data")
+            return
+
+        pad_l, pad_r, pad_t, pad_b = 12, 12, 22, 28
+        plot_w = w - pad_l - pad_r
+        plot_h = h - pad_t - pad_b
+        vmax = max(v for _l, v in self.data) or 1.0
+        imax = max(range(len(self.data)), key=lambda i: self.data[i][1])
+
+        n = len(self.data)
+        slot = plot_w / n
+        bw = min(slot * 0.6, 60)
+
+        p.setFont(QFont("", 8))
+        for i, (label, v) in enumerate(self.data):
+            bh = (v / vmax) * plot_h
+            x = pad_l + slot * i + (slot - bw) / 2
+            y = pad_t + (plot_h - bh)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(ACCENT if i == imax else "#3a4360"))
+            p.drawRoundedRect(QRectF(x, y, bw, bh), 4, 4)
+            # value above
+            p.setPen(QColor(TEXT))
+            vtxt = f"{v:.0f}{self.suffix}" if v == int(v) else f"{v:.1f}{self.suffix}"
+            p.drawText(QRectF(pad_l + slot * i, y - 18, slot, 16),
+                       Qt.AlignHCenter | Qt.AlignBottom, vtxt)
+            # label below
+            p.setPen(QColor(MUTED))
+            p.drawText(QRectF(pad_l + slot * i, h - pad_b + 4, slot, 20),
+                       Qt.AlignHCenter | Qt.AlignTop, label)
+
+
+def fmt_duration(seconds):
+    """Human-readable duration for legends: 45s, 12m 30s, 1h 05m."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
+class PieChart(QWidget):
+    """Two-slice donut: episode time vs normal time, with a legend and centre total.
+
+    set_data takes (episode_seconds, normal_seconds). Handles the all-zero case
+    (no sessions in range) by drawing an empty ring instead of dividing by zero.
+    """
+
+    EP_COLOR = "#ff6b5e"      # episode (SMM) time
+    NORM_COLOR = "#3ecf8e"    # normal time
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ep = 0.0
+        self.norm = 0.0
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_data(self, ep_seconds, normal_seconds):
+        self.ep = max(float(ep_seconds), 0.0)
+        self.norm = max(float(normal_seconds), 0.0)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(PANEL))
+
+        total = self.ep + self.norm
+        size = min(h, w * 0.55) - 24
+        cx, cy = 12 + size / 2, h / 2
+        ring = size * 0.26
+        rect = QRectF(cx - size / 2, cy - size / 2, size, size)
+        inner = QRectF(rect.x() + ring, rect.y() + ring,
+                       rect.width() - 2 * ring, rect.height() - 2 * ring)
+
+        if total <= 0:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(LINE))
+            p.drawEllipse(rect)
+            p.setBrush(QColor(PANEL))
+            p.drawEllipse(inner)
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("", 10))
+            p.drawText(rect, Qt.AlignCenter, "no data")
+            return
+
+        # two wedges, drawn then punched out to a ring
+        p.setPen(Qt.NoPen)
+        start = 90 * 16  # top, clockwise
+        for value, color in ((self.ep, self.EP_COLOR), (self.norm, self.NORM_COLOR)):
+            span = -int(round(value / total * 360 * 16))
+            p.setBrush(QColor(color))
+            p.drawPie(rect, start, span)
+            start += span
+        p.setBrush(QColor(PANEL))
+        p.drawEllipse(inner)
+
+        # centre: total time
+        p.setPen(QColor(TEXT))
+        p.setFont(QFont("", 13, QFont.Bold))
+        p.drawText(QRectF(inner.x(), inner.y() + inner.height() * 0.24,
+                          inner.width(), inner.height() * 0.32),
+                   Qt.AlignHCenter | Qt.AlignBottom, fmt_duration(total))
+        p.setPen(QColor(MUTED))
+        p.setFont(QFont("", 8))
+        p.drawText(QRectF(inner.x(), inner.y() + inner.height() * 0.56,
+                          inner.width(), inner.height() * 0.3),
+                   Qt.AlignHCenter | Qt.AlignTop, "total time")
+
+        # legend
+        lx = 12 + size + 24
+        rows = [("Episode time", self.ep, self.EP_COLOR),
+                ("Normal time", self.norm, self.NORM_COLOR)]
+        ly = (h - len(rows) * 40) / 2
+        for i, (label, value, color) in enumerate(rows):
+            y = ly + i * 40
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(color))
+            p.drawRoundedRect(QRectF(lx, y + 2, 14, 14), 3, 3)
+            p.setPen(QColor(TEXT))
+            p.setFont(QFont("", 10, QFont.Bold))
+            pct = value / total * 100
+            p.drawText(QRectF(lx + 24, y, w - lx - 28, 18),
+                       Qt.AlignVCenter | Qt.AlignLeft, f"{label}   {pct:.1f}%")
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("", 9))
+            p.drawText(QRectF(lx + 24, y + 18, w - lx - 28, 18),
+                       Qt.AlignVCenter | Qt.AlignLeft, fmt_duration(value))
+
+
 # ── main window ──────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -292,9 +543,11 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
+        self.IDLE, self.RUNNING, self.REPORT, self.DASHBOARD = 0, 1, 2, 3
         self.stack.addWidget(self._build_idle())
         self.stack.addWidget(self._build_running())
         self.stack.addWidget(self._build_report())
+        self.stack.addWidget(self._build_dashboard())
 
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._tick)
@@ -519,12 +772,19 @@ class MainWindow(QMainWindow):
         tp.addWidget(self.timeline)
         root.addWidget(tl_panel, 1)
 
+        nrow = QHBoxLayout()
         ncap = QLabel("Notes")
         ncap.setObjectName("statlabel")
+        nrow.addWidget(ncap)
+        nrow.addStretch(1)
+        self.notes_btn = QPushButton("Save notes")
+        self.notes_btn.setObjectName("ghost")
+        self.notes_btn.clicked.connect(self.save_notes)
+        nrow.addWidget(self.notes_btn)
         self.notes = QTextEdit()
         self.notes.setMaximumHeight(80)
         self.notes.setPlaceholderText("What was this session? Anything worth remembering.")
-        root.addWidget(ncap)
+        root.addLayout(nrow)
         root.addWidget(self.notes)
 
         bar = QHBoxLayout()
@@ -534,13 +794,193 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         again = QPushButton("New session")
         again.setObjectName("ghost")
-        again.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        self.save_btn = QPushButton("Save session")
-        self.save_btn.clicked.connect(self.save_session)
+        again.clicked.connect(lambda: self.stack.setCurrentIndex(self.IDLE))
+        self.reports_btn = QPushButton("View all reports")
+        self.reports_btn.clicked.connect(self.open_dashboard)
         bar.addWidget(again)
-        bar.addWidget(self.save_btn)
+        bar.addWidget(self.reports_btn)
         root.addLayout(bar)
         return page
+
+    # ── dashboard ──
+    def _build_dashboard(self):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(40, 32, 40, 32)
+        root.setSpacing(16)
+
+        top = QHBoxLayout()
+        head = QLabel("All session reports")
+        head.setObjectName("h1")
+        top.addWidget(head)
+        top.addStretch(1)
+        back = QPushButton("New session")
+        back.setObjectName("ghost")
+        back.clicked.connect(lambda: self.stack.setCurrentIndex(self.IDLE))
+        top.addWidget(back)
+        root.addLayout(top)
+
+        self.dash_sub = QLabel("")
+        self.dash_sub.setObjectName("muted")
+        root.addWidget(self.dash_sub)
+
+        # time-range selector — filters the whole dashboard
+        sel = QHBoxLayout()
+        sel.setSpacing(8)
+        rlbl = QLabel("Show:")
+        rlbl.setObjectName("muted")
+        sel.addWidget(rlbl)
+        self.range_btns = {}
+        for key, text in [("today", "Today"), ("week", "This week"),
+                          ("month", "This month"), ("all", "All time")]:
+            b = QPushButton(text)
+            b.setObjectName("ghost")
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c=False, k=key: self.set_range(k))
+            self.range_btns[key] = b
+            sel.addWidget(b)
+        sel.addStretch(1)
+        root.addLayout(sel)
+        self.dash_range = "all"
+
+        # summary cards — aggregates across every saved session
+        cards = panel()
+        cg = QGridLayout(cards)
+        cg.setContentsMargins(24, 20, 24, 20)
+        cg.setHorizontalSpacing(30)
+        agg = [("Sessions", "d_n"), ("Total time", "d_time"), ("Total episodes", "d_epi"),
+               ("Avg SMMs / min", "d_rate"), ("Avg time in SMM", "d_pct"),
+               ("Avg peak rate", "d_peak")]
+        for i, (label, attr) in enumerate(agg):
+            w, lbl = stat_block("—", label)
+            setattr(self, attr, lbl)
+            cg.addWidget(w, 0, i)
+        root.addWidget(cards)
+
+        # charts row: episode vs normal pie + episode contribution donut + SMMs/min bars
+        charts = QHBoxLayout()
+        charts.setSpacing(16)
+
+        pie_panel = panel()
+        pie_l = QVBoxLayout(pie_panel)
+        pie_l.setContentsMargins(16, 14, 16, 14)
+        pcap = QLabel("Episode time vs normal time")
+        pcap.setObjectName("statlabel")
+        self.pie = PieChart()
+        pie_l.addWidget(pcap)
+        pie_l.addWidget(self.pie)
+        charts.addWidget(pie_panel, 1)
+
+        root.addLayout(charts, 1)
+
+        # per-session table
+        tbl_panel = panel()
+        tpl = QVBoxLayout(tbl_panel)
+        tpl.setContentsMargins(14, 12, 14, 12)
+        tcap = QLabel("Every session, newest first")
+        tcap.setObjectName("statlabel")
+        tpl.addWidget(tcap)
+
+        self.COLS = [
+            ("When", "timestamp"), ("Duration", "duration_s"), ("Episodes", "n_episodes"),
+            ("SMMs/min", "smms_per_min"), ("% SMM", "pct_time_smm"),
+            ("Median ep.", "median_episode_s"), ("Peak rate", "peak_rate"),
+            ("% alerting", "pct_time_alerting"), ("Threshold", "threshold"),
+            ("FPS", "mean_fps"), ("Notes", "notes"),
+        ]
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels([h for h, _k in self.COLS])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setStyleSheet(f"""
+            QTableWidget {{ background: {PANEL}; border: none; gridline-color: {LINE};
+                            alternate-background-color: #171a22; }}
+            QHeaderView::section {{ background: {PANEL}; color: {MUTED}; border: none;
+                                    border-bottom: 1px solid {LINE}; padding: 8px 10px;
+                                    font-weight: 600; }}
+            QTableWidget::item {{ padding: 8px 10px; border-bottom: 1px solid {LINE}; }}
+            QTableWidget::item:selected {{ background: #232838; color: {TEXT}; }}
+        """)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(len(self.COLS) - 1, QHeaderView.Stretch)  # Notes takes slack
+        tpl.addWidget(self.table)
+        root.addWidget(tbl_panel, 1)
+
+        self.dash_empty = QLabel("No sessions in this range.")
+        self.dash_empty.setObjectName("muted")
+        self.dash_empty.setAlignment(Qt.AlignCenter)
+        self.dash_empty.setVisible(False)
+        root.addWidget(self.dash_empty)
+
+        return page
+
+    def set_range(self, key):
+        self.dash_range = key
+        for k, b in self.range_btns.items():
+            b.setChecked(k == key)
+        self.refresh_dashboard()
+
+    def refresh_dashboard(self):
+        # keep the toggle buttons in sync when opened directly
+        for k, b in self.range_btns.items():
+            b.setChecked(k == self.dash_range)
+
+        all_rows = read_sessions(self.cfg)
+        rows = filter_sessions_by_range(all_rows, self.dash_range)
+        self.dash_empty.setVisible(not rows)
+        self.table.setVisible(bool(rows))
+
+        n = len(rows)
+        span = {"today": "today", "week": "in the last 7 days",
+                "month": "in the last 30 days", "all": "recorded"}[self.dash_range]
+        self.dash_sub.setText(f"{n} session{'s' if n != 1 else ''} {span}")
+
+        if rows:
+            total_time = sum(r.get("duration_s", 0) or 0 for r in rows)
+            total_epi = sum(int(r.get("n_episodes", 0) or 0) for r in rows)
+            avg = lambda k: sum(r.get(k, 0) or 0 for r in rows) / n
+            self.d_n.setText(str(n))
+            self.d_time.setText(fmt_hms(total_time))
+            self.d_epi.setText(str(total_epi))
+            self.d_rate.setText(f"{avg('smms_per_min'):.2f}")
+            self.d_pct.setText(f"{avg('pct_time_smm'):.1f}%")
+            self.d_peak.setText(f"{avg('peak_rate'):.2f}")
+        else:
+            for attr in ("d_n", "d_time", "d_epi", "d_rate", "d_pct", "d_peak"):
+                getattr(self, attr).setText("—")
+
+        # pie: episode time vs normal time, summed across the filtered range
+        ep, norm = episode_vs_normal_time(rows)
+        self.pie.set_data(ep, norm)
+
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, (_h, key) in enumerate(self.COLS):
+                self.table.setItem(i, j, QTableWidgetItem(self._fmt_cell(key, r.get(key))))
+
+    @staticmethod
+    def _fmt_cell(key, val):
+        if val is None or val == "":
+            return "—" if key != "notes" else ""
+        if key == "timestamp":
+            return str(val).replace("T", "  ")
+        if key == "duration_s":
+            return fmt_hms(val)
+        if key in ("smms_per_min", "peak_rate"):
+            return f"{float(val):.2f}"
+        if key in ("pct_time_smm", "pct_time_alerting"):
+            return f"{float(val):.1f}%"
+        if key == "median_episode_s":
+            return f"{float(val):.1f}s"
+        if key == "threshold":
+            return f"{float(val):.3f}"
+        if key == "mean_fps":
+            return f"{float(val):.1f}"
+        return str(val)
 
     # ── control ──
     def start_session(self):
@@ -634,16 +1074,26 @@ class MainWindow(QMainWindow):
         self.r_fps.setText(f"{s['mean_fps']:.1f}")
 
         self.timeline.set_data(self.recorder.trace, self.recorder.episodes(), self.threshold)
-        self.saved_lbl.setText("")
-        self.save_btn.setEnabled(True)
         self.notes.clear()
 
-    def save_session(self):
-        if not self.recorder:
+        # Auto-save the moment the report opens — no separate Save button.
+        csv_path, _trace_path = self.recorder.save(self.summary, "")
+        self.saved_id = self.summary["session_id"]
+        self.saved_lbl.setText(f"Saved to {csv_path}  ·  add notes below and press Save notes")
+        self.notes_btn.setEnabled(True)
+
+    def save_notes(self):
+        sid = getattr(self, "saved_id", None)
+        if not sid:
             return
-        csv_path, trace_path = self.recorder.save(self.summary, self.notes.toPlainText())
-        self.saved_lbl.setText(f"Appended to {csv_path}  ·  trace saved to {trace_path}")
-        self.save_btn.setEnabled(False)
+        if update_notes(self.cfg, sid, self.notes.toPlainText()):
+            self.saved_lbl.setText("Notes saved.")
+        else:
+            self.saved_lbl.setText("Could not find the saved row to update.")
+
+    def open_dashboard(self):
+        self.refresh_dashboard()
+        self.stack.setCurrentIndex(self.DASHBOARD)
 
     def closeEvent(self, e):
         if self.worker:

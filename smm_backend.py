@@ -29,7 +29,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -413,6 +413,8 @@ class SessionRecorder:
             "n_windows": len(self.trace),
             "n_flagged": sum(1 for _t, _p, f in self.trace if f),
             "n_episodes": len(eps),
+            "episode_time_s": round(smm_time, 1),
+            "normal_time_s": round(max(dur - smm_time, 0.0), 1),
             "smms_per_min": round(len(eps) / max(dur / 60, 1e-6), 3),
             "pct_time_smm": round(100 * smm_time / max(dur, 1e-6), 2),
             "median_episode_s": round(median, 2),
@@ -448,6 +450,114 @@ class SessionRecorder:
                           for t, p, _f in self.trace],
             }, f, indent=1)
         return self.cfg.log_csv, path
+
+
+def update_notes(cfg: Config, session_id: str, notes: str) -> bool:
+    """Rewrite the notes cell of one already-saved session row in place.
+
+    Returns True if the row was found and updated. Used when the operator types
+    notes on the report screen after the session has already been auto-saved.
+    """
+    if not os.path.exists(cfg.log_csv):
+        return False
+    with open(cfg.log_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames
+        rows = list(reader)
+    if not fields or "notes" not in fields:
+        return False
+
+    hit = False
+    for row in rows:
+        if row.get("session_id") == session_id:
+            row["notes"] = notes.replace("\n", " ").strip()
+            hit = True
+    if hit:
+        with open(cfg.log_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(rows)
+    return hit
+
+
+def read_sessions(cfg: Config) -> list[dict]:
+    """Read every saved session back from log.csv, newest first.
+
+    Reading the log is backend work — the dashboard is only a view over this.
+    Returns [] when no sessions have been saved yet. Numeric columns are cast
+    back to float/int so the caller doesn't have to reparse strings.
+    """
+    if not os.path.exists(cfg.log_csv):
+        return []
+
+    int_cols = {"n_windows", "n_flagged", "n_episodes"}
+    rows = []
+    with open(cfg.log_csv, newline="") as f:
+        for raw in csv.DictReader(f):
+            row = dict(raw)
+            for k, v in list(row.items()):
+                if k in ("session_id", "timestamp", "notes"):
+                    continue
+                try:
+                    row[k] = int(v) if k in int_cols else float(v)
+                except (TypeError, ValueError):
+                    pass  # leave unparseable values as-is
+            rows.append(row)
+    rows.reverse()  # newest first
+    return rows
+
+
+# Time ranges the dashboard can filter by. "all" means no filtering.
+RANGES = ("today", "week", "month", "all")
+
+
+def filter_sessions_by_range(rows: list[dict], range_key: str,
+                             now: datetime | None = None) -> list[dict]:
+    """Keep only sessions whose timestamp falls in the given window.
+
+    range_key: "today" (since local midnight), "week" (last 7 days),
+    "month" (last 30 days), or "all". Rows with an unparseable timestamp are
+    dropped for any range other than "all".
+    """
+    if range_key == "all":
+        return rows
+    now = now or datetime.now()
+    if range_key == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif range_key == "week":
+        cutoff = now - timedelta(days=7)
+    elif range_key == "month":
+        cutoff = now - timedelta(days=30)
+    else:
+        return rows
+
+    out = []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(str(r.get("timestamp", "")))
+        except (TypeError, ValueError):
+            continue
+        if ts >= cutoff:
+            out.append(r)
+    return out
+
+
+def episode_vs_normal_time(rows: list[dict]) -> tuple[float, float]:
+    """Sum episode time and normal time across sessions (seconds).
+
+    Falls back to deriving episode time from pct_time_smm x duration for older
+    rows saved before episode_time_s existed, so a mixed log still totals right.
+    """
+    ep = norm = 0.0
+    for r in rows:
+        dur = float(r.get("duration_s", 0) or 0)
+        if r.get("episode_time_s") not in (None, ""):
+            e = float(r["episode_time_s"])
+        else:  # legacy row: reconstruct from percentage
+            e = dur * float(r.get("pct_time_smm", 0) or 0) / 100.0
+        ep += e
+        norm += max(dur - e, 0.0)
+    return round(ep, 1), round(norm, 1)
 
 
 # ── self-test ────────────────────────────────────────────────────────────────
