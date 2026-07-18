@@ -424,9 +424,12 @@ class SessionRecorder:
         }
 
     def save(self, summary: dict, notes: str = "") -> tuple[str, str]:
-        """Append one row to log.csv and dump the full trace. Returns both paths.
+        """Append one row to log.csv and return its path.
         The CSV is opened in append mode — earlier sessions are never overwritten.
+        The per-window trace is not persisted; it only lives in memory for the
+        report screen.
         """
+
         os.makedirs(self.cfg.sessions_dir, exist_ok=True)
         row = dict(summary)
         row["notes"] = notes.replace("\n", " ").strip()
