@@ -438,19 +438,6 @@ class SessionRecorder:
                 w.writeheader()
             w.writerow(row)
 
-        rates = {round(t, 3): round(r, 4) for t, r, _a in self.rate_trace}
-        path = os.path.join(self.cfg.sessions_dir, f"{row['session_id']}_trace.json")
-        with open(path, "w") as f:
-            json.dump({
-                "session": row,
-                "episodes": [{"start_s": round(s, 2), "end_s": round(e, 2)}
-                             for s, e in self.episodes()],
-                "trace": [{"t": round(t, 3), "prob": round(p, 4),
-                           "rate": rates.get(round(t, 3))}
-                          for t, p, _f in self.trace],
-            }, f, indent=1)
-        return self.cfg.log_csv, path
-
 
 def update_notes(cfg: Config, session_id: str, notes: str) -> bool:
     """Rewrite the notes cell of one already-saved session row in place.

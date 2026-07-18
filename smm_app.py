@@ -857,7 +857,7 @@ class MainWindow(QMainWindow):
             cg.addWidget(w, 0, i)
         root.addWidget(cards)
 
-        # charts row: episode vs normal pie + episode contribution donut + SMMs/min bars
+        # charts row: episode vs normal pie
         charts = QHBoxLayout()
         charts.setSpacing(16)
 
@@ -1077,7 +1077,7 @@ class MainWindow(QMainWindow):
         self.notes.clear()
 
         # Auto-save the moment the report opens — no separate Save button.
-        csv_path, _trace_path = self.recorder.save(self.summary, "")
+        csv_path = self.recorder.save(self.summary, "")
         self.saved_id = self.summary["session_id"]
         self.saved_lbl.setText(f"Saved to {csv_path}  ·  add notes below and press Save notes")
         self.notes_btn.setEnabled(True)
