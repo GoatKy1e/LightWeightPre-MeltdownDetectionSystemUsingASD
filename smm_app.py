@@ -531,7 +531,7 @@ class PieChart(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SMM live detector")
+        self.setWindowTitle("Pre-meltodown live detector")
         #self.resize(1240, 760)
         self.showFullScreen()
         self.showMaximized()
@@ -572,9 +572,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(60, 50, 60, 50)
         root.setSpacing(18)
 
-        title = QLabel("SMM live detector")
+        title = QLabel("Pre Meltdown live detector")
         title.setObjectName("h1")
-        sub = QLabel("Stereotypical motor movement detection from webcam pose  ·  "
+        sub = QLabel("Pre Meltdown detection through Stereotypical motor movement analysis from webcam  ·  "
                      "MoveNet → 1D-CNN")
         sub.setObjectName("muted")
         root.addWidget(title)
