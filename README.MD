@@ -16,10 +16,12 @@ per-session summary.
 | File | Purpose |
 |---|---|
 | `asdmotion_prep.ipynb` | Turns the annotated pickle into windowed feature arrays for training. |
-| `asdmotion_train_v1_tensorflow.ipynb` | Trains the model in three stages (initial → improved → tuned), evaluates, and saves the winner. |
+| `asdmotion_train_v1_tensorflow.ipynb` | Trains the model in three stages (initial → improved → tuned), validates the chosen configuration across multiple seeds, evaluates, and saves the deployed model. |
 | `Temporal_Detection_test.ipynb` | Evaluates the trained model on continuous/temporal data rather than isolated windows. |
 | `smm_backend.py` | The detection pipeline: pose, features, model, alerter, episode logic, session logging. No UI. |
-| `smm_app.py` | Desktop front end (PySide6). Start/stop live detection and view a session report. |
+| `smm_app.py` | Desktop front end (PySide6). Start/stop live detection, view a session report, and review all sessions. |
+| `tests/UnitTesting.py` | Unit tests for the backend components (config, feature processor, alerter, episodes, recorder, persistence). |
+| `tests/IntegrationTesting.py` | Integration tests for the connected pipeline, feature parity, and the record/storage chain. |
 
 ### Not in the repo (generated or external)
 
@@ -32,7 +34,7 @@ above. A fresh clone **builds** but is not **runnable** until these exist:
 | `prepared/` | Written by the prep and training notebooks (feature arrays, `v1_model.keras`, `scaler.json`, `v1_meta.json`). |
 | `prepared/*.tflite` | Converted from the trained model + downloaded MoveNet (see setup). |
 | `kt_dir/` | Keras-tuner search state, regenerated when training runs. |
-| `sessions/` | Created by the app each time a session is saved. |
+| `sessions/` | Created by the app; holds `log.csv`, one row per saved session. |
 
 ---
 
@@ -111,9 +113,12 @@ Run `asdmotion_train_v1_tensorflow.ipynb`. It trains three stages and keeps the 
 - **tuned** — a Keras-tuner Bayesian search over kernel size, dropout, learning rate,
   weight decay, and augmentation strength (filter widths fixed).
 
-The winner (best validation PR-AUC) is saved as `prepared/v1_model.keras`, and the
-decision threshold that meets the target recall is written to `prepared/v1_meta.json`.
-A multi-seed cell reports mean ± std so results aren't a single lucky run.
+The winner (best validation PR-AUC of improved vs. tuned) is chosen as the final
+configuration. That configuration is then retrained across five random seeds, and the
+test metrics are reported as **mean ± std** so results aren't a single lucky run. The
+best-validation seed of that run is saved as `prepared/v1_model.keras`, so the deployed
+model is a member of the reported distribution, and the decision threshold that meets the
+target recall is written to `prepared/v1_meta.json`.
 
 ### 3. Produce the files the live app needs
 
@@ -189,9 +194,12 @@ the current SMM probability, a rolling-rate meter with the enter/confirm levels 
 a 60-second score plot, and duration/episode counters. Press **Stop** (or `Esc`) to end.
 
 **Report screen.** Session summary — duration, episodes, SMMs per minute, % time in SMM,
-median episode length, peak rate, time alerting. **Save session** appends one row to
-`sessions/log.csv` and writes the full score trace to `sessions/<id>_trace.json`.
-The CSV is append-only; past sessions are never overwritten.
+median episode length, peak rate, time alerting, mean FPS. The session is **saved
+automatically** the moment the report opens, appending one row to `sessions/log.csv`; an
+observation typed into the note field is then written back to that same row. The CSV is
+append-only; past sessions are never overwritten. The per-window score trace is held in
+memory for the report timeline only and is not persisted. **View all reports** opens a
+dashboard aggregating every saved session, with a today/week/month/all filter.
 
 > **Calibrate the threshold per setup.** The threshold saved during training was chosen
 > on the evaluation data (OpenPose keypoints). The live app uses MoveNet, whose keypoint
@@ -216,7 +224,7 @@ attached lives in the backend.**
                  ┌───────────────▼──────────── smm_backend.py (no UI) ───────────┐
    frame ──▶ SmmEngine.process() ──▶ Result(prob, rate, alert, state, keypoints)
               │  MoveNet → StreamingFeatureProcessor (90×20 window) → 1D-CNN → Alerter
-              └─ SessionRecorder: episodes, summary stats, log.csv + trace JSON
+              └─ SessionRecorder: episodes, summary stats, log.csv
 ```
 
 - **`SmmEngine`** — one frame in, one `Result` out. Camera-agnostic: a webcam, a video
@@ -232,6 +240,34 @@ Quick headless check of the pipeline (no camera, no UI):
 
 ```bash
 python smm_backend.py --selftest
+```
+
+---
+
+## Testing
+
+Two test suites live under `tests/`, keyed to the test cases in the project report.
+
+- `UnitTesting.py` — 30 unit cases. The 20 backend cases (config, feature processor,
+  alerter, episodes, recorder, persistence) run with no models or camera. The 10 interface
+  cases are verified manually and are listed in the report rather than automated here.
+- `IntegrationTesting.py` — 10 integration cases. The four that exercise the live
+  `SmmEngine` require the TFLite models under `prepared/` and are **skipped automatically**
+  when those files are absent; the rest (feature parity, the record/storage chain) always
+  run.
+
+Run both from the repository root so the relative `prepared/` and `sessions/` paths
+resolve:
+
+```bash
+python -m unittest discover -s tests -t . -v
+```
+
+Or run each individually:
+
+```bash
+python -m unittest tests.UnitTesting -v
+python -m unittest tests.IntegrationTesting -v
 ```
 
 ---
